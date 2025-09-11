@@ -1,0 +1,73 @@
+import os
+import subprocess
+from flask import Flask, request, jsonify
+import boto3
+from botocore.client import Config
+import uuid
+
+app = Flask(__name__)
+
+S3_INTERNAL_ENDPOINT = os.environ.get('S3_INTERNAL_ENDPOINT')
+S3_PUBLIC_ENDPOINT = os.environ.get('S3_PUBLIC_ENDPOINT')
+S3_ACCESS_KEY = os.environ.get('S3_ACCESS_KEY')
+S3_SECRET_KEY = os.environ.get('S3_SECRET_KEY')
+S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
+
+s3 = boto3.client(
+    's3',
+    endpoint_url=S3_INTERNAL_ENDPOINT,
+    aws_access_key_id=S3_ACCESS_KEY,
+    aws_secret_access_key=S3_SECRET_KEY,
+    config=Config(signature_version='s3v4')
+)
+
+@app.route('/process', methods=['POST'])
+def process_video():
+    data = request.json
+    input_url = data.get('input_url')
+    command_template = data.get('command')
+    output_path = data.get('output_path')
+
+    if not input_url or not command_template:
+        return jsonify({"error": "Missing input_url or command"}), 400
+
+    try:
+        task_id = str(uuid.uuid4())
+        input_filename = f"/tmp/{task_id}_input"
+        output_extension = data.get('output_extension', 'mp4')
+        output_filename = f"/tmp/{task_id}_output.{output_extension}"
+
+        subprocess.run(['wget', '-O', input_filename, input_url], check=True, timeout=300)
+
+        command = command_template.format(input=input_filename, output=output_filename)
+
+        if "ffprobe" in command:
+             result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True, timeout=60)
+             os.remove(input_filename)
+             return jsonify({"status": "success", "output": result.stdout.strip()})
+
+        subprocess.run(command, shell=True, check=True, timeout=600)
+
+        if output_path:
+            s3_object_name = output_path.lstrip('/')
+        else:
+            s3_object_name = f"processed/{task_id}.{output_extension}"
+
+        s3.upload_file(output_filename, S3_BUCKET_NAME, s3_object_name, ExtraArgs={'ACL': 'public-read'})
+
+        output_url = f"{S3_PUBLIC_ENDPOINT.rstrip('/')}/{S3_BUCKET_NAME}/{s3_object_name}"
+
+        os.remove(input_filename)
+        os.remove(output_filename)
+
+        return jsonify({"status": "success", "output_url": output_url})
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Processing timed out"}), 500
+    except subprocess.CalledProcessError as e:
+        return jsonify({"error": "FFmpeg/FFprobe command failed", "details": str(e), "stderr": e.stderr if hasattr(e, 'stderr') else ''}), 500
+    except Exception as e:
+        return jsonify({"error": "An internal error occurred", "details": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))

@@ -1,73 +1,130 @@
 import os
 import subprocess
+import uuid
+import json
 from flask import Flask, request, jsonify
 import boto3
 from botocore.client import Config
-import uuid
+import requests
 
 app = Flask(__name__)
 
-S3_INTERNAL_ENDPOINT = os.environ.get('S3_INTERNAL_ENDPOINT')
-S3_PUBLIC_ENDPOINT = os.environ.get('S3_PUBLIC_ENDPOINT')
-S3_ACCESS_KEY = os.environ.get('S3_ACCESS_KEY')
-S3_SECRET_KEY = os.environ.get('S3_SECRET_KEY')
-S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
+# --- 从环境变量读取 R2 配置 ---
+R2_ENDPOINT_URL = os.environ.get('R2_S3_ENDPOINT')
+R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID')
+R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY')
+R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')
+R2_PUBLIC_DOMAIN = os.environ.get('R2_PUBLIC_DOMAIN') # 例如：https://pub-....r2.dev
 
+# --- 初始化 S3 客户端 ---
 s3 = boto3.client(
     's3',
-    endpoint_url=S3_INTERNAL_ENDPOINT,
-    aws_access_key_id=S3_ACCESS_KEY,
-    aws_secret_access_key=S3_SECRET_KEY,
+    endpoint_url=R2_ENDPOINT_URL,
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
     config=Config(signature_version='s3v4')
 )
 
-@app.route('/process', methods=['POST'])
-def process_video():
-    data = request.json
-    input_url = data.get('input_url')
-    command_template = data.get('command')
-    output_path = data.get('output_path')
+def download_file(url, target_path):
+    """下载文件到指定路径"""
+    try:
+        with requests.get(url, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            with open(target_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Failed to download {url}: {e}")
 
-    if not input_url or not command_template:
-        return jsonify({"error": "Missing input_url or command"}), 400
+@app.route('/process', methods=['POST'])
+def process_media():
+    data = request.json
+    # --- 接收输入参数 ---
+    input_urls = data.get('input_urls', []) # 接收 URL 数组
+    command_template = data.get('command')
+    output_path = data.get('output_path', '')
+
+    # --- 参数校验 ---
+    if not command_template or not isinstance(input_urls, list) or not input_urls:
+        return jsonify({"error": "Missing 'command' or 'input_urls' must be a non-empty list"}), 400
+
+    task_id = str(uuid.uuid4())
+    temp_dir = f"/tmp/{task_id}"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    input_files = []
+    output_filename = ''
 
     try:
-        task_id = str(uuid.uuid4())
-        input_filename = f"/tmp/{task_id}_input"
+        # --- 下载所有输入文件 ---
+        for i, url in enumerate(input_urls):
+            # 自动从 URL 推断文件扩展名，或默认为 .tmp
+            extension = os.path.splitext(url.split('?')[0])[-1] or '.tmp'
+            input_filename = f"{temp_dir}/input_{i}{extension}"
+            download_file(url, input_filename)
+            input_files.append(input_filename)
+
+        # --- 为多文件拼接（concat）生成协议文件 ---
+        if 'concat_list.txt' in command_template:
+            concat_list_path = f"{temp_dir}/concat_list.txt"
+            with open(concat_list_path, 'w') as f:
+                for file_path in input_files:
+                    f.write(f"file '{os.path.basename(file_path)}'\n")
+            # 注入 concat 文件路径
+            command_template = command_template.replace('concat_list.txt', concat_list_path)
+
+        # --- 设置输出文件路径 ---
         output_extension = data.get('output_extension', 'mp4')
-        output_filename = f"/tmp/{task_id}_output.{output_extension}"
+        output_filename = f"{temp_dir}/output.{output_extension}"
 
-        subprocess.run(['wget', '-O', input_filename, input_url], check=True, timeout=300)
+        # --- 构建并执行命令 ---
+        # 使用 str.format 替换占位符，例如 {input_0}, {input_1}, {output}
+        # 为了安全和灵活性，我们用一个字典来格式化
+        format_dict = {f'input_{i}': path for i, path in enumerate(input_files)}
+        format_dict['output'] = output_filename
+        
+        # 为了兼容简单的单文件输入，也提供 {input}
+        if len(input_files) == 1:
+            format_dict['input'] = input_files[0]
+            
+        command = command_template.format(**format_dict)
+        
+        # --- 执行命令并处理结果 ---
+        result = subprocess.run(
+            command, 
+            shell=True, 
+            check=True, 
+            capture_output=True, 
+            text=True, 
+            timeout=900,
+            cwd=temp_dir # 在临时目录执行，以确保 concat 等操作能找到文件
+        )
 
-        command = command_template.format(input=input_filename, output=output_filename)
+        if "ffprobe" in command.lower():
+            return jsonify({"status": "success", "output": result.stdout.strip()})
 
-        if "ffprobe" in command:
-             result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True, timeout=60)
-             os.remove(input_filename)
-             return jsonify({"status": "success", "output": result.stdout.strip()})
+        # --- 上传结果到 R2 ---
+        s3_object_name = output_path.lstrip('/') if output_path else f"processed/{task_id}.{output_extension}"
+        s3.upload_file(output_filename, R2_BUCKET_NAME, s3_object_name, ExtraArgs={'ContentType': f'video/{output_extension}'})
+        
+        if not R2_PUBLIC_DOMAIN:
+             return jsonify({"error": "R2_PUBLIC_DOMAIN environment variable is not set."}), 500
 
-        subprocess.run(command, shell=True, check=True, timeout=600)
-
-        if output_path:
-            s3_object_name = output_path.lstrip('/')
-        else:
-            s3_object_name = f"processed/{task_id}.{output_extension}"
-
-        s3.upload_file(output_filename, S3_BUCKET_NAME, s3_object_name, ExtraArgs={'ACL': 'public-read'})
-
-        output_url = f"{S3_PUBLIC_ENDPOINT.rstrip('/')}/{S3_BUCKET_NAME}/{s3_object_name}"
-
-        os.remove(input_filename)
-        os.remove(output_filename)
-
-        return jsonify({"status": "success", "output_url": output_url})
+        # --- 构建公网 URL ---
+        final_output_url = f"{R2_PUBLIC_DOMAIN.rstrip('/')}/{s3_object_name}"
+        return jsonify({"status": "success", "output_url": final_output_url})
 
     except subprocess.TimeoutExpired:
         return jsonify({"error": "Processing timed out"}), 500
     except subprocess.CalledProcessError as e:
-        return jsonify({"error": "FFmpeg/FFprobe command failed", "details": str(e), "stderr": e.stderr if hasattr(e, 'stderr') else ''}), 500
+        return jsonify({"error": "FFmpeg/FFprobe command failed", "stderr": e.stderr}), 500
     except Exception as e:
         return jsonify({"error": "An internal error occurred", "details": str(e)}), 500
+    finally:
+        # --- 清理临时文件 ---
+        if os.path.exists(temp_dir):
+            import shutil
+            shutil.rmtree(temp_dir)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))

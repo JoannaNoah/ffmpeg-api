@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
-# 设置环境变量 PORT 为 Zeabur 需要的端口
 ENV PORT=8080
+ENV GUNICORN_CMD_ARGS="--workers 3 --threads 1 --timeout 900"
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "2", "--timeout", "900", "app:app"]
+CMD exec gunicorn --bind 0.0.0.0:$PORT $GUNICORN_CMD_ARGS app:app
